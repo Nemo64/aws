@@ -9,47 +9,75 @@ use AsyncAws\DynamoDb\DynamoDbClient;
  */
 class SessionHandler implements \SessionHandlerInterface
 {
-    /**
-     * @var DynamoDbClient
-     */
-    private $dynamoDb;
+    /** @var SessionConnectionInterface Session save logic.*/
+    private $connection;
 
-    /**
-     * @var string Session save path.
-     */
+    /** @var string Session save path. */
     private $savePath;
 
-    /**
-     * @var string Session name.
-     */
+    /** @var string Session name. */
     private $sessionName;
 
-    /**
-     * @var string The last known session ID
-     */
+    /** @var string The last known session ID */
     private $openSessionId = '';
 
-    /**
-     * @var string Stores serialized data for tracking changes.
-     */
+    /** @var string Stores serialized data for tracking changes. */
     private $dataRead = '';
 
-    /**
-     * @var bool Keeps track of whether the session has been written.
-     */
+    /** @var bool Keeps track of whether the session has been written. */
     private $sessionWritten = false;
 
-    public function __construct(DynamoDbClient $dynamoDb)
+    /**
+     * Creates a new DynamoDB Session Handler.
+     *
+     * The configuration array accepts the following array keys and values:
+     * - table_name:                    Name of table to store the sessions.
+     * - hash_key:                      Name of hash key in table. Default: "id".
+     * - data_attribute:                Name of the data attribute in table. Default: "data".
+     * - session_lifetime:              Lifetime of inactive sessions expiration.
+     * - session_lifetime_attribute:    Name of the session life time attribute in table. Default: "expires".
+     * - consistent_read:               Whether or not to use consistent reads.
+     * - batch_config:                  Batch options used for garbage collection.
+     * - locking:                       Whether or not to use session locking.
+     * - max_lock_wait_time:            Max time (s) to wait for lock acquisition.
+     * - min_lock_retry_microtime:      Min time (µs) to wait between lock attempts.
+     * - max_lock_retry_microtime:      Max time (µs) to wait between lock attempts.
+     *
+     * You can find the full list of parameters and defaults within the trait
+     * Aws\DynamoDb\SessionConnectionConfigTrait
+     *
+     * @param DynamoDbClient $client Client for doing DynamoDB operations
+     * @param array          $config Configuration for the Session Handler
+     *
+     * @return SessionHandler
+     */
+    public static function fromClient(DynamoDbClient $client, array $config = [])
     {
-        $this->dynamoDb = $dynamoDb;
+        $config += ['locking' => false];
+        if ($config['locking']) {
+            $connection = new LockingSessionConnection($client, $config);
+        } else {
+            $connection = new StandardSessionConnection($client, $config);
+        }
+
+        return new static($connection);
+    }
+
+    /**
+     * @param SessionConnectionInterface $connection
+     */
+    public function __construct(SessionConnectionInterface $connection)
+    {
+        $this->connection = $connection;
     }
 
     /**
      * Register the DynamoDB session handler.
      *
-     * @return bool whether or not the handler was registered
+     * @return bool Whether or not the handler was registered.
+     * @codeCoverageIgnore
      */
-    public function register(): bool
+    public function register()
     {
         return session_set_save_handler($this, true);
     }
@@ -57,10 +85,10 @@ class SessionHandler implements \SessionHandlerInterface
     /**
      * Open a session for writing. Triggered by session_start().
      *
-     * @param string $savePath    session save path
-     * @param string $sessionName session name
+     * @param string $savePath    Session save path.
+     * @param string $sessionName Session name.
      *
-     * @return bool whether or not the operation succeeded
+     * @return bool Whether or not the operation succeeded.
      */
     public function open($savePath, $sessionName)
     {
@@ -91,9 +119,9 @@ class SessionHandler implements \SessionHandlerInterface
     /**
      * Read a session stored in DynamoDB.
      *
-     * @param string $id session ID
+     * @param string $id Session ID.
      *
-     * @return string session data
+     * @return string Session data.
      */
     public function read($id)
     {
@@ -123,10 +151,10 @@ class SessionHandler implements \SessionHandlerInterface
     /**
      * Write a session to DynamoDB.
      *
-     * @param string $id   session ID
-     * @param string $data serialized session data to write
+     * @param string $id   Session ID.
+     * @param string $data Serialized session data to write.
      *
-     * @return bool whether or not the operation succeeded
+     * @return bool Whether or not the operation succeeded.
      */
     public function write($id, $data)
     {
@@ -144,9 +172,9 @@ class SessionHandler implements \SessionHandlerInterface
     /**
      * Delete a session stored in DynamoDB.
      *
-     * @param string $id session ID
+     * @param string $id Session ID.
      *
-     * @return bool whether or not the operation succeeded
+     * @return bool Whether or not the operation succeeded.
      */
     public function destroy($id)
     {
@@ -160,33 +188,25 @@ class SessionHandler implements \SessionHandlerInterface
 
     /**
      * Satisfies the session handler interface, but does nothing. To do garbage
-     * collection, you must manually call the garbageCollect() method.
+     * collection, you should configure the lifetime column as a TTL column
      *
-     * @param int $maxLifetime ignored
+     * @param int $maxLifetime Ignored.
      *
-     * @return bool whether or not the operation succeeded
+     * @return bool Whether or not the operation succeeded.
+     * @codeCoverageIgnore
      */
     public function gc($maxLifetime)
     {
-        // Garbage collection for a DynamoDB table must be triggered manually.
+        // Garbage collection for a DynamoDB table must be handled by TTL configuration
         return true;
-    }
-
-    /**
-     * Triggers garbage collection on expired sessions.
-     *
-     */
-    public function garbageCollect()
-    {
-        $this->connection->deleteExpired();
     }
 
     /**
      * Prepend the session ID with the session name.
      *
-     * @param string $id the session ID
+     * @param string $id The session ID.
      *
-     * @return string prepared session ID
+     * @return string Prepared session ID.
      */
     private function formatId($id)
     {
